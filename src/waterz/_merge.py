@@ -332,7 +332,12 @@ def merge_region_graphs(
     keys["lo"] = lo
     keys["hi"] = hi
 
-    _, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
+    # return_index gives the first occurrence per unique key directly
+    # (vectorized in C), so no separate Python-level scan over `inverse`
+    # is needed to recover it.
+    _, first_idx, inverse, counts = np.unique(
+        keys, return_index=True, return_inverse=True, return_counts=True
+    )
     n_unique = len(counts)
 
     # Weighted sum: sum(score_i * area_i) and sum(area_i)
@@ -347,18 +352,8 @@ def merge_region_graphs(
     merged_affs = (weighted_sum / safe_area).astype(np.float32)
 
     # Extract canonical id pairs (take the first occurrence per unique key)
-    merged_id1 = np.empty(n_unique, dtype=np.uint64)
-    merged_id2 = np.empty(n_unique, dtype=np.uint64)
-    # Use the first occurrence for each unique key
-    first_idx = np.empty(n_unique, dtype=np.intp)
-    seen = np.zeros(n_unique, dtype=np.bool_)
-    for i in range(len(inverse)):
-        g = inverse[i]
-        if not seen[g]:
-            first_idx[g] = i
-            seen[g] = True
-    merged_id1[:] = lo[first_idx]
-    merged_id2[:] = hi[first_idx]
+    merged_id1 = lo[first_idx]
+    merged_id2 = hi[first_idx]
 
     # Sort descending by score
     order = np.argsort(-merged_affs)
