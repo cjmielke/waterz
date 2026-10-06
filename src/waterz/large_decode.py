@@ -529,7 +529,7 @@ class LargeDecodeRunner:
             )
 
         path = self._raw_chunk_path(chunk.key)
-        self._write_chunk_seg(path, seg)
+        self._write_chunk_seg(path, seg, compress=True)
 
         # Pre-extract boundary faces as .npy so connect_border avoids HDF5 re-reads
         for axis, dim, side_idx in [("z", 0, -1), ("y", 1, -1), ("x", 2, -1)]:
@@ -649,7 +649,7 @@ class LargeDecodeRunner:
             )
             seg = seg[base_local]
         path = self._final_chunk_path(chunk.key)
-        self._write_chunk_seg(path, seg)
+        self._write_chunk_seg(path, seg, compress=True)
         return {"chunk_path": str(path), "max_id": int(seg.max())}
 
     def handle_assemble_output(self, record: TaskRecord) -> Dict[str, Any]:
@@ -743,7 +743,7 @@ class LargeDecodeRunner:
         seg = np.asarray(seg, dtype=np.uint64)
         premerge_result = self._premerge_chunk_fragments(seg, affs)
         path = self._raw_chunk_path(chunk_key)
-        self._write_chunk_seg(path, seg)
+        self._write_chunk_seg(path, seg, compress=True)
         return {
             "chunk_path": str(path),
             "max_id": int(seg.max()) if seg.size else 0,
