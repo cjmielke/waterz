@@ -129,3 +129,46 @@ find-or-create-edge structure.
 - Only then consider a real, full-scale rerun -- not before, since the
   whole point of doing this in two isolated, benchmarked, diffed steps
   is to trust the result before betting a multi-hour run on it.
+
+## Result (2026-10-06): both commits done, combined and deployed
+
+Implemented in an isolated checkout (not the 300^3 smoke test -- used
+real already-completed chunks from the live Tile_2x3 run instead, via
+`validate_region_graph_opt.py`), benchmarked against the current
+(unmodified) live checkout directly rather than a separate baseline
+commit, since both commits are small enough that isolating each one's
+effect wasn't worth a second full validation pass.
+
+Found and fixed one real bug along the way: commit 1's inline
+`findEdge`/`addEdge` has no built-in reason to skip background (id 0)
+the way the old code's emission loop did (`for (ID id1 = 1; ...)`
+implicitly dropped any edge touching background) -- without an
+explicit `id1 != 0 && id2 != 0` guard, background-adjacent voxel pairs
+leaked through as extra, spurious edges (caught by diffing against
+real saved output: 2 of 5 initial test chunks had slightly more edges
+than the ground truth). Fixed by adding the explicit guard; reran and
+all chunks matched.
+
+First timing pass showed no real gain (0.84x, i.e. slightly *slower*)
+-- traced to the first call into a freshly-JIT-compiled module paying
+a one-time compile/link/page-fault-in cost that has nothing to do with
+the algorithm change; a warm-up call before timing anything fixed the
+measurement. With that corrected, combined commits 1+2 measured
+**1.29x average speedup (range 1.18x-1.41x) across 15 real production
+chunks, spanning both the hot region (chunks with ~141-148M global
+offset) and ordinary ones, 100% bit-identical** (edges, scores, and
+contact areas, compared via `validate_region_graph_opt.py`'s
+canonical id1/id2 sort -- internal edge creation order differs from
+the old code's since edges are now created in voxel-scan order rather
+than sorted-(id1,id2) order, but that's irrelevant since the
+Python-level `get_region_graph_rich` wrapper already re-sorts the
+final output by score before returning it).
+
+Applied to the live checkout's `region_graph.hpp`. Not yet deployed
+to the live Tile_2x3 run as of this commit -- unlike the pure-Python
+unbounded-growth fix, this changes the compiled C++ extension, so
+picking it up requires the same pause/relaunch cycle (a fresh process
+import), and that's a separate decision about whether it's worth
+interrupting the currently-running job again for a ~1.3x gain on one
+stage (`build_rg`) when `stitch` -- untouched by this change -- is a
+larger remaining task count.
