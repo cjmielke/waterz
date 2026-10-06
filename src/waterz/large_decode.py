@@ -865,20 +865,35 @@ class LargeDecodeRunner:
             affs = affs.astype(np.float32, copy=False)
         seg = self._read_chunk_seg(self._raw_chunk_path(chunk_key))
 
-        # Apply global offset so IDs are unique across chunks
-        offsets = self._read_json(self._offsets_path())
-        offset = int(offsets["chunk_offsets"][chunk_key])
-        if offset:
-            mask = seg > 0
-            seg[mask] += offset
-
         from ._merge import get_region_graph_rich
 
+        # Build the region graph on this chunk's own LOCAL fragment ids
+        # (do NOT pre-offset seg here). frontend_agglomerate.cpp's
+        # buildRegionGraphRich sizes several per-call structures --
+        # `sizes`, RegionGraph's incidence lists, and region_graph.hpp's
+        # per-node affinities vector -- by seg.max()+1. Passing pre-offset
+        # global ids made every chunk's cost scale with the cumulative
+        # fragment count of every chunk processed *before* it (unbounded
+        # growth over a long run -- by late chunks this is hundreds of
+        # millions to billions, causing 20-40GB+ allocations regardless of
+        # this chunk's own real complexity, which tops out around
+        # 150-270K fragments). Applying the offset only to the returned
+        # id1/id2 edge-endpoint arrays (O(edges), ~1M elements) instead of
+        # to the full volume keeps each call's cost proportional to this
+        # chunk's own size, as intended. Verified bit-identical against
+        # production output on 5 real chunks (including the worst-offset
+        # ones from this run) -- see validate_rg_fix.py.
         rg_affs, id1, id2, contact_areas = get_region_graph_rich(
             seg,
             affs,
             scoring_function=self.config.affinity_scoring_function,
         )
+
+        offsets = self._read_json(self._offsets_path())
+        offset = int(offsets["chunk_offsets"][chunk_key])
+        if offset:
+            id1 = id1 + offset
+            id2 = id2 + offset
 
         path = self._rg_chunk_path(chunk_key)
         path.parent.mkdir(parents=True, exist_ok=True)
