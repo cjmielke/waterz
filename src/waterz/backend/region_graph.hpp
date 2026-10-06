@@ -40,10 +40,21 @@ get_region_graph(
 	std::ptrdiff_t ydim = aff.shape()[2];
 	std::ptrdiff_t xdim = aff.shape()[3];
 
-	// list of affinities between pairs of regions
-	std::vector<std::map<ID, std::vector<F>>> affinities(max_segid+1);
+	// Stream samples directly into the statistics provider as each is
+	// discovered (no per-edge buffering -- Histogram::inc / running-sum
+	// style providers are already fully online, so there was never a need
+	// to collect the full sample set upfront; this removes O(samples)
+	// small heap allocations spread across hundreds of thousands of
+	// independent per-edge vectors).
+	//
+	// Cache the last-resolved (id1,id2) -> edge pair across loop
+	// iterations: consecutive voxels along the fast-varying (innermost, x)
+	// axis very often sit on the same straight fragment boundary, turning
+	// a large fraction of lookups into one branch comparison instead of
+	// even the cheap findEdge scan.
+	ID lastU = 0, lastV = 0;
+	EdgeIdType lastE = RegionGraphType::NoEdge;
 
-	EdgeIdType e;
 	std::size_t p[3];
 	for (p[0] = 0; p[0] < zdim; ++p[0])
 		for (p[1] = 0; p[1] < ydim; ++p[1])
@@ -59,26 +70,25 @@ get_region_graph(
 
 					ID id2 = seg[p[0]-(d==0)][p[1]-(d==1)][p[2]-(d==2)];
 
-					if (id1 != id2) {
+					if (id1 != id2 && id1 != 0 && id2 != 0) {
 
-						auto mm = std::minmax(id1, id2);
-						affinities[mm.first][mm.second].push_back(aff[d][p[0]][p[1]][p[2]]);
+						EdgeIdType e;
+						if (id1 == lastU && id2 == lastV) {
+							e = lastE;
+						} else {
+							e = rg.findEdge(id1, id2);
+							if (e == RegionGraphType::NoEdge) {
+								e = rg.addEdge(id1, id2);
+								statisticsProvider.notifyNewEdge(e);
+							}
+							lastU = id1;
+							lastV = id2;
+							lastE = e;
+						}
+						statisticsProvider.addAffinity(e, aff[d][p[0]][p[1]][p[2]]);
 					}
 				}
 			}
-
-	for (ID id1 = 1; id1 <= max_segid; ++id1) {
-		for (const auto& p: affinities[id1]) {
-
-			// p.first is ID
-			// p.second is list of affiliated edges
-			EdgeIdType e = rg.addEdge(id1, p.first);
-			statisticsProvider.notifyNewEdge(e);
-
-			for (F affinity : p.second)
-				statisticsProvider.addAffinity(e, affinity);
-        }
-    }
 
 	std::cout << "Region graph number of edges: " << rg.edges().size() << std::endl;
 }
@@ -108,10 +118,14 @@ get_region_graph(
 	std::ptrdiff_t ydim = aff.shape()[2];
 	std::ptrdiff_t xdim = aff.shape()[3];
 
-	// list of affinities between pairs of regions
-	std::vector<std::map<ID, std::vector<F>>> affinities(max_segid+1);
+	// See the non-rich overload above for rationale (streaming +
+	// last-resolved-edge cache). edge_counts grows in lockstep with edge
+	// creation (both strictly sequential, 0,1,2,... by construction).
+	edge_counts.clear();
 
-	EdgeIdType e;
+	ID lastU = 0, lastV = 0;
+	EdgeIdType lastE = RegionGraphType::NoEdge;
+
 	std::size_t p[3];
 	for (p[0] = 0; p[0] < zdim; ++p[0])
 		for (p[1] = 0; p[1] < ydim; ++p[1])
@@ -127,33 +141,27 @@ get_region_graph(
 
 					ID id2 = seg[p[0]-(d==0)][p[1]-(d==1)][p[2]-(d==2)];
 
-					if (id1 != id2) {
+					if (id1 != id2 && id1 != 0 && id2 != 0) {
 
-						auto mm = std::minmax(id1, id2);
-						affinities[mm.first][mm.second].push_back(aff[d][p[0]][p[1]][p[2]]);
+						EdgeIdType e;
+						if (id1 == lastU && id2 == lastV) {
+							e = lastE;
+						} else {
+							e = rg.findEdge(id1, id2);
+							if (e == RegionGraphType::NoEdge) {
+								e = rg.addEdge(id1, id2);
+								statisticsProvider.notifyNewEdge(e);
+								edge_counts.push_back(0);
+							}
+							lastU = id1;
+							lastV = id2;
+							lastE = e;
+						}
+						statisticsProvider.addAffinity(e, aff[d][p[0]][p[1]][p[2]]);
+						edge_counts[e]++;
 					}
 				}
 			}
-
-	for (ID id1 = 1; id1 <= max_segid; ++id1) {
-		for (const auto& p: affinities[id1]) {
-
-			EdgeIdType e = rg.addEdge(id1, p.first);
-			statisticsProvider.notifyNewEdge(e);
-
-			for (F affinity : p.second)
-				statisticsProvider.addAffinity(e, affinity);
-        }
-    }
-
-	// Fill edge_counts with the contact area (number of affinity samples) per edge
-	edge_counts.clear();
-	edge_counts.reserve(rg.numEdges());
-	for (ID id1 = 1; id1 <= max_segid; ++id1) {
-		for (const auto& p: affinities[id1]) {
-			edge_counts.push_back(static_cast<uint64_t>(p.second.size()));
-		}
-	}
 
 	std::cout << "Region graph number of edges: " << rg.edges().size() << std::endl;
 }
