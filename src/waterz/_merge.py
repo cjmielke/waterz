@@ -335,6 +335,7 @@ def get_region_graph_rich(
 def merge_region_graphs(
     rg_list: list[Tuple[NDArray, NDArray, NDArray, NDArray]],
     assume_disjoint_ids: bool = False,
+    sort: bool = True,
 ) -> Tuple[NDArray[np.float32], NDArray[np.uint64], NDArray[np.uint64], NDArray[np.uint64]]:
     """Merge multiple region graphs via weighted-mean scoring by contact area.
 
@@ -360,11 +361,25 @@ def merge_region_graphs(
         constant. Passing True when graphs can actually share edges will
         silently keep duplicates instead of merging them, so only use it
         when disjointness is structural, not just empirically observed.
+    sort : bool, default True
+        Only affects the ``assume_disjoint_ids=True`` path. Default True
+        preserves this function's documented contract (sorted output) for
+        any caller that relies on it. Set False to skip the final
+        ``argsort`` + reindex entirely when the caller doesn't need sorted
+        output -- e.g. a threshold filter like ``rg_affs >= t`` produces
+        the same result regardless of input order. This matters at full
+        volume scale: the index array alone for an argsort over ~billions
+        of edges needs 8 bytes/edge (int64), which can dwarf the data
+        itself. As of this writing, this package's own large_decode
+        pipeline (the only caller) never needs the sort for this reason,
+        but defaults stay safe for anyone calling this directly.
 
     Returns
     -------
     rg_affs : ndarray, float32, shape ``(E,)``
-        Merged scored affinities, sorted descending.
+        Merged scored affinities, sorted descending if ``sort=True``
+        (``assume_disjoint_ids=True`` path only -- the dedup path below
+        always sorts).
     id1, id2 : ndarray, uint64, shape ``(E,)``
         Edge endpoints.
     contact_areas : ndarray, uint64, shape ``(E,)``
@@ -389,6 +404,8 @@ def merge_region_graphs(
         lo = np.minimum(all_id1, all_id2)
         hi = np.maximum(all_id1, all_id2)
         del all_id1, all_id2
+        if not sort:
+            return all_affs, lo, hi, all_areas
         order = np.argsort(-all_affs)
         return all_affs[order], lo[order], hi[order], all_areas[order]
 
