@@ -53,25 +53,46 @@ def build_overlap_remap(
     if len(src_vals) == 0:
         return {}
 
-    # Pack (dst, src) pairs and count occurrences
-    pairs = np.empty(len(dst_vals), dtype=[("dst", np.uint64), ("src", np.uint64)])
-    pairs["dst"] = dst_vals
-    pairs["src"] = src_vals
+    # Count occurrences of each (dst, src) pair. If both fit in 32 bits
+    # (checked against the real data, not assumed -- large_decode's
+    # chunked ids can exceed that at full volume scale, though not at
+    # this dataset's size), pack them into a single scalar uint64 key
+    # instead of a structured dtype. np.unique on a structured dtype
+    # falls back to slow generic element-wise comparison; a scalar key
+    # gets numpy's fast sort path. Measured ~48x faster on real overlap
+    # data (814ms -> 17ms) and this unique() call was the actual dominant
+    # cost of the whole stitch task (~96% of per-task time, see
+    # optimization-plan.md) -- not the HDF5 reads it sits next to, which
+    # is why optimizing those alone barely moved live throughput.
+    max_val = int(max(src_vals.max(), dst_vals.max()))
+    if max_val <= 0xFFFFFFFF:
+        key = (dst_vals << np.uint64(32)) | src_vals
+        unique_keys, pair_counts = np.unique(key, return_counts=True)
+        dst_arr = (unique_keys >> np.uint64(32)).astype(np.uint64)
+        src_arr = (unique_keys & np.uint64(0xFFFFFFFF)).astype(np.uint64)
+    else:
+        pairs = np.empty(len(dst_vals), dtype=[("dst", np.uint64), ("src", np.uint64)])
+        pairs["dst"] = dst_vals
+        pairs["src"] = src_vals
+        unique_pairs, pair_counts = np.unique(pairs, return_counts=True)
+        dst_arr = unique_pairs["dst"]
+        src_arr = unique_pairs["src"]
 
-    unique_pairs, pair_counts = np.unique(pairs, return_counts=True)
+    # For each dst ID, find the src ID with the highest count. dst_arr is
+    # already sorted ascending, with src ascending as the tiebreak within
+    # each dst group (true for both the packed-key and structured-dtype
+    # paths above). Re-sort by (dst ascending, count descending) -- a
+    # stable sort preserves each dst-group's original src-ascending order
+    # among count ties, so the first row of each dst group is the
+    # max-count winner, with ties broken toward the smaller src id --
+    # replaces an equivalent O(U) Python loop with per-iteration dict
+    # lookups (U = number of unique pairs) that was here before.
+    order = np.lexsort((-pair_counts.astype(np.int64), dst_arr))
+    dst_sorted = dst_arr[order]
+    src_sorted = src_arr[order]
+    _, first_idx = np.unique(dst_sorted, return_index=True)
 
-    # For each dst ID, find the src ID with the highest count
-    remap: dict[int, int] = {}
-    best_count: dict[int, int] = {}
-
-    for i in range(len(unique_pairs)):
-        dst_id = int(unique_pairs["dst"][i])
-        src_id = int(unique_pairs["src"][i])
-        count = int(pair_counts[i])
-        if dst_id not in best_count or count > best_count[dst_id]:
-            remap[dst_id] = src_id
-            best_count[dst_id] = count
-
+    remap = dict(zip(dst_sorted[first_idx].tolist(), src_sorted[first_idx].tolist()))
     return remap
 
 
