@@ -27,6 +27,7 @@ __all__ = [
     "merge_region_graphs",
     "merge_segments",
     "merge_dust",
+    "smallest_uint_dtype",
     "strip_boundary",
 ]
 
@@ -167,11 +168,25 @@ def _mask_channels(affs: np.ndarray, channels: str) -> np.ndarray:
     return affs
 
 
+def smallest_uint_dtype(max_value: int, floor: "np.dtype" = np.uint16) -> "np.dtype":
+    """Smallest unsigned integer dtype that can hold ``max_value``, no smaller
+    than ``floor``. Falls back to uint64 if ``max_value`` exceeds uint32."""
+    candidates = [np.dtype(np.uint16), np.dtype(np.uint32), np.dtype(np.uint64)]
+    floor = np.dtype(floor)
+    for dt in candidates:
+        if dt.itemsize < floor.itemsize:
+            continue
+        if max_value <= np.iinfo(dt).max:
+            return dt
+    return np.dtype(np.uint64)
+
+
 def get_region_graph(
     seg: NDArray[np.uint64],
     affs: NDArray,
     scoring_function: str = "MeanAffinity<RegionGraphType, ScoreValue>",
     channels: str = "all",
+    compact_dtypes: bool = False,
 ) -> Tuple[NDArray[np.float32], NDArray[np.uint64], NDArray[np.uint64]]:
     """Build region graph using waterz's JIT-compiled scoring functions.
 
@@ -200,12 +215,18 @@ def get_region_graph(
     channels : str
         Which affinity directions to include: ``"all"`` (default),
         ``"z"`` (z-only), or ``"xy"`` (xy-only).
+    compact_dtypes : bool
+        If True, downcast the returned arrays to the smallest dtype that
+        safely holds the actual data (ids to uint32 unless they don't fit,
+        scores to float16 when the source affinities are uint8-quantized).
+        Default False preserves the documented uint64/float32 return types
+        for existing callers.
 
     Returns
     -------
-    rg_affs : ndarray, float32, shape ``(E,)``
+    rg_affs : ndarray, float32 (or float16 if compact_dtypes), shape ``(E,)``
         Scored affinity per edge, sorted descending.
-    id1, id2 : ndarray, uint64, shape ``(E,)``
+    id1, id2 : ndarray, uint64 (or uint32 if compact_dtypes), shape ``(E,)``
         Edge endpoints.
     """
     from ._agglomerate import build_region_graph_only
@@ -228,6 +249,13 @@ def get_region_graph(
     id1 = np.array([e["u"] for e in rg_list], dtype=np.uint64)
     id2 = np.array([e["v"] for e in rg_list], dtype=np.uint64)
 
+    if compact_dtypes:
+        id_dtype = smallest_uint_dtype(int(max(id1.max(), id2.max())), floor=np.uint32)
+        id1 = id1.astype(id_dtype, copy=False)
+        id2 = id2.astype(id_dtype, copy=False)
+        if aff_dtype == np.uint8:
+            rg_affs = rg_affs.astype(np.float16, copy=False)
+
     order = np.argsort(-rg_affs)
     return rg_affs[order], id1[order], id2[order]
 
@@ -237,6 +265,7 @@ def get_region_graph_rich(
     affs: NDArray,
     scoring_function: str = "MeanAffinity<RegionGraphType, ScoreValue>",
     channels: str = "all",
+    compact_dtypes: bool = False,
 ) -> Tuple[NDArray[np.float32], NDArray[np.uint64], NDArray[np.uint64], NDArray[np.uint64]]:
     """Build region graph with contact area using waterz's JIT-compiled scoring.
 
@@ -253,14 +282,20 @@ def get_region_graph_rich(
         C++ scoring function type string (raw, not OneMinus-wrapped).
     channels : str
         Which affinity directions: ``"all"``, ``"z"``, or ``"xy"``.
+    compact_dtypes : bool
+        If True, downcast the returned arrays to the smallest dtype that
+        safely holds the actual data (ids to uint32, contact_areas to
+        uint16/uint32, scores to float16 when the source affinities are
+        uint8-quantized) unless they don't fit. Default False preserves
+        the documented uint64/float32 return types for existing callers.
 
     Returns
     -------
-    rg_affs : ndarray, float32, shape ``(E,)``
+    rg_affs : ndarray, float32 (or float16 if compact_dtypes), shape ``(E,)``
         Scored affinity per edge, sorted descending.
-    id1, id2 : ndarray, uint64, shape ``(E,)``
+    id1, id2 : ndarray, uint64 (or uint32 if compact_dtypes), shape ``(E,)``
         Edge endpoints.
-    contact_areas : ndarray, uint64, shape ``(E,)``
+    contact_areas : ndarray, uint64 (or uint16/uint32 if compact_dtypes), shape ``(E,)``
         Number of affinity samples per edge.
     """
     from ._agglomerate import build_region_graph_rich
@@ -283,6 +318,15 @@ def get_region_graph_rich(
     id1 = np.array([e["u"] for e in rg_list], dtype=np.uint64)
     id2 = np.array([e["v"] for e in rg_list], dtype=np.uint64)
     contact_areas = np.array([e["contact_area"] for e in rg_list], dtype=np.uint64)
+
+    if compact_dtypes:
+        id_dtype = smallest_uint_dtype(int(max(id1.max(), id2.max())), floor=np.uint32)
+        id1 = id1.astype(id_dtype, copy=False)
+        id2 = id2.astype(id_dtype, copy=False)
+        area_dtype = smallest_uint_dtype(int(contact_areas.max()), floor=np.uint16)
+        contact_areas = contact_areas.astype(area_dtype, copy=False)
+        if aff_dtype == np.uint8:
+            rg_affs = rg_affs.astype(np.float16, copy=False)
 
     order = np.argsort(-rg_affs)
     return rg_affs[order], id1[order], id2[order], contact_areas[order]
