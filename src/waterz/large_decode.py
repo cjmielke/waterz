@@ -33,7 +33,6 @@ from .large_workflow import (
     build_large_decode_tasks_overlap,
 )
 from .orchestrator import TaskRecord, WorkflowOrchestrator
-from .overlap_stitch import build_overlap_remap
 from .region_graph import merge_id
 
 __all__ = [
@@ -852,11 +851,30 @@ class LargeDecodeRunner:
             dst_mask = overlap_dst > 0
             overlap_dst[dst_mask] += dst_offset
 
-        remap = build_overlap_remap(overlap_src, overlap_dst)
-        if remap:
-            pairs = np.asarray(list(remap.items()), dtype=np.uint64)
-        else:
-            pairs = np.empty((0, 2), dtype=np.uint64)
+        # build_overlap_remap did a bare majority vote -- whichever src
+        # fragment a dst fragment shares the most voxels with, merge them,
+        # unconditionally, even if that overlap is a tiny, unconvincing
+        # fraction of either fragment's true size. face_merge_pairs (already
+        # used by the sibling connect_border strategy, with real safety
+        # checks -- min overlap size, IOU, one-sided containment, affinity
+        # validation -- that this function's own config already carries
+        # defaults for, just unused by this code path until now) rejects
+        # low-confidence matches instead of forcing one, which is a credible
+        # fix for the excess merger rate measured against the skeleton
+        # ground truth (631/1275 tree-pairs merged with threshold=2.0, i.e.
+        # entirely from stitching, since agglomeration contributed nothing).
+        # slice_overlaps/face_merge_pairs don't assume 2D anywhere in their
+        # logic -- the mask-and-np.unique approach works on these 3D overlap
+        # volumes exactly as well as on the 2D faces they were written for.
+        pairs = face_merge_pairs(
+            overlap_src,
+            overlap_dst,
+            min_overlap=self.config.min_overlap,
+            iou_threshold=self.config.iou_threshold,
+            one_sided_threshold=self.config.one_sided_threshold,
+            one_sided_min_size=self.config.one_sided_min_size,
+            affinity_threshold=0.0,  # no affinity map read here; keep disabled
+        )
 
         path = self._stitch_path(border_key)
         path.parent.mkdir(parents=True, exist_ok=True)
