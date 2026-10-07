@@ -25,7 +25,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, Iterator, Mapping, Optional, Sequence
 
 __all__ = [
     "TaskRecord",
@@ -177,17 +177,68 @@ class WorkflowOrchestrator:
                 continue
             self._write_record(TaskRecord(spec=spec))
 
-    def list_records(self) -> list[TaskRecord]:
+    def list_records(
+        self, *, stages: Optional[Iterable[str]] = None
+    ) -> list[TaskRecord]:
+        """List task records, optionally narrowed to given stages.
+
+        _task_filename slugifies "{stage}:{key}" as one string, but every
+        stage name in this package (fragment, offsets, stitch, build_rg,
+        merge_rg, agglomerate, apply, assemble) is plain alphanumeric/
+        underscore, so the only character the slugify regex ever touches
+        is the ":" separator -> "_". That makes "{stage}_*.json" a safe,
+        exact prefix glob for these stages specifically -- not a general
+        guarantee for arbitrary future stage names with other characters.
+        Narrowing here (instead of loading and filtering everything, then
+        discarding most of it) matters once total task count grows large:
+        with ~42k tasks across this workflow's stages, loading+parsing
+        every one of them on every single claim (claim_ready_task calls
+        this once per attempt, every ~0.5s poll from every worker) cost
+        ~1s per claim -- which became the dominant cost once per-task
+        algorithmic work was optimized down to ~80ms (see
+        optimization-plan.md's stitch rounds 1-2). Dependency checks
+        (_deps_satisfied) are unaffected: they look up each dep by its
+        own task_id directly (O(1) file read), never via this list.
+        """
         records = []
-        for path in sorted(self.tasks_dir.glob("*.json")):
-            try:
-                records.append(self._load_record_retry(path))
-            except FileNotFoundError:
-                continue
+        if stages is not None:
+            patterns = [f"{stage}_*.json" for stage in stages]
+        else:
+            patterns = ["*.json"]
+        for pattern in patterns:
+            for path in sorted(self.tasks_dir.glob(pattern)):
+                try:
+                    records.append(self._load_record_retry(path))
+                except FileNotFoundError:
+                    continue
         return sorted(records, key=lambda r: (r.spec.stage, r.spec.key, r.spec.name))
 
     def get_record(self, task_id: str) -> TaskRecord:
         return self._load_record_retry(self._record_path(task_id))
+
+    def _iter_records_lazy(
+        self, *, stages: Optional[Iterable[str]] = None
+    ) -> Iterator[TaskRecord]:
+        """Like list_records, but yields one at a time instead of eagerly
+        loading+sorting everything first. claim_ready_task only needs the
+        first record that's pending, stage/name-allowed, and dep-satisfied
+        -- it was paying to parse every remaining task file (tens of
+        thousands, once build_rg/stitch grow large) even when the first
+        matching candidate sat near the front, because list_records always
+        materializes its full, sorted result before any filtering starts.
+        No sort here since claim order doesn't need to be deterministic,
+        only "some pending, ready task" -- same semantics as before.
+        """
+        if stages is not None:
+            patterns = [f"{stage}_*.json" for stage in stages]
+        else:
+            patterns = ["*.json"]
+        for pattern in patterns:
+            for path in self.tasks_dir.glob(pattern):
+                try:
+                    yield self._load_record_retry(path)
+                except FileNotFoundError:
+                    continue
 
     def claim_ready_task(
         self,
@@ -202,7 +253,7 @@ class WorkflowOrchestrator:
         allowed_stage_set = set(allowed_stages) if allowed_stages is not None else None
         worker_id = worker_id or _default_worker_id()
 
-        for record in self.list_records():
+        for record in self._iter_records_lazy(stages=allowed_stage_set):
             if record.state is not TaskState.PENDING:
                 continue
             if (
