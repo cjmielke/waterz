@@ -19,7 +19,6 @@ import numpy as np
 from ._merge import (
     get_region_graph,
     merge_function_to_scoring,
-    merge_region_graphs,
     merge_segments,
 )
 from ._waterz import waterz as _run_waterz
@@ -865,7 +864,7 @@ class LargeDecodeRunner:
             affs = affs.astype(np.float32, copy=False)
         seg = self._read_chunk_seg(self._raw_chunk_path(chunk_key))
 
-        from ._merge import get_region_graph_rich
+        from ._merge import get_region_graph_rich, smallest_uint_dtype
 
         # Build the region graph on this chunk's own LOCAL fragment ids
         # (do NOT pre-offset seg here). frontend_agglomerate.cpp's
@@ -887,44 +886,74 @@ class LargeDecodeRunner:
             seg,
             affs,
             scoring_function=self.config.affinity_scoring_function,
+            compact_dtypes=True,
         )
 
         offsets = self._read_json(self._offsets_path())
         offset = int(offsets["chunk_offsets"][chunk_key])
         if offset:
-            id1 = id1 + offset
-            id2 = id2 + offset
+            # Re-check (don't assume) the dtype still holds after adding the
+            # global offset -- auto-widens (e.g. uint32 -> uint64) if a much
+            # larger run ever pushes the cumulative id count past uint32,
+            # instead of silently overflowing a fixed-width type.
+            combined_max = int(max(id1.max(), id2.max())) + offset if len(id1) else 0
+            id_dtype = smallest_uint_dtype(combined_max, floor=id1.dtype)
+            id1 = id1.astype(id_dtype, copy=False) + np.asarray(offset, dtype=id_dtype)
+            id2 = id2.astype(id_dtype, copy=False) + np.asarray(offset, dtype=id_dtype)
 
         path = self._rg_chunk_path(chunk_key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(path, rg_affs=rg_affs, id1=id1, id2=id2, contact_areas=contact_areas)
+        np.savez_compressed(path, rg_affs=rg_affs, id1=id1, id2=id2, contact_areas=contact_areas)
         return {"rg_path": str(path), "num_edges": len(rg_affs)}
 
     def handle_merge_rg(self, record: TaskRecord) -> Dict[str, Any]:
-        """Merge per-chunk region graphs into a single global region graph."""
-        rg_list = []
+        """Merge per-chunk region graphs into the set of edges that qualify
+        for agglomeration -- filtering each chunk's own (small) edge list by
+        the threshold at load time, before concatenating, rather than
+        concatenating all 7200 chunks first and filtering afterward.
+
+        handle_agglomerate only ever consumes this output via a boolean
+        threshold filter (`rg_affs >= threshold`), which is distributive
+        over concatenation: filter-then-concat and concat-then-filter give
+        the same survivor set. Filtering first means this only ever holds
+        one chunk's data plus the (for any reasonably selective threshold,
+        much smaller) accumulated survivor set at once -- never the full
+        ~90GB unfiltered dataset, and never a global sort (handle_agglomerate
+        doesn't need sorted input either, see optimization-plan.md). At the
+        degenerate threshold=2.0 used to isolate raw stitched fragments (see
+        optimization-plan.md), this reduces to zero survivors essentially
+        for free, same as the old threshold>1.0 special case it replaces.
+        """
+        threshold = max(self.config.thresholds)
+        survivor_affs: list[np.ndarray] = []
+        survivor_id1: list[np.ndarray] = []
+        survivor_id2: list[np.ndarray] = []
+        survivor_areas: list[np.ndarray] = []
+        n_total_edges = 0
         for chunk in self.chunks:
             path = self._rg_chunk_path(chunk.key)
             data = np.load(path)
-            rg_list.append(
-                (
-                    data["rg_affs"],
-                    data["id1"],
-                    data["id2"],
-                    data["contact_areas"],
+            rg_affs = data["rg_affs"]
+            n_total_edges += len(rg_affs)
+            qualify = rg_affs >= threshold
+            if qualify.any():
+                survivor_affs.append(rg_affs[qualify].astype(np.float32, copy=False))
+                survivor_id1.append(data["id1"][qualify].astype(np.uint64, copy=False))
+                survivor_id2.append(data["id2"][qualify].astype(np.uint64, copy=False))
+                survivor_areas.append(
+                    data["contact_areas"][qualify].astype(np.uint64, copy=False)
                 )
-            )
 
-        # Each chunk's local segmentation ids were offset into their own
-        # exclusive global range by the id_offsets stage before this
-        # chunk's region graph was built, so no two chunks can ever
-        # share a segment id or edge -- safe to skip merge_region_graphs'
-        # dedup step, which cannot complete in bounded memory at full
-        # volume scale.
-        merged_affs, merged_id1, merged_id2, merged_areas = merge_region_graphs(
-            rg_list, assume_disjoint_ids=True
-        )
-        del rg_list
+        if survivor_affs:
+            merged_affs = np.concatenate(survivor_affs)
+            merged_id1 = np.concatenate(survivor_id1)
+            merged_id2 = np.concatenate(survivor_id2)
+            merged_areas = np.concatenate(survivor_areas)
+        else:
+            merged_affs = np.empty(0, dtype=np.float32)
+            merged_id1 = np.empty(0, dtype=np.uint64)
+            merged_id2 = np.empty(0, dtype=np.uint64)
+            merged_areas = np.empty(0, dtype=np.uint64)
 
         path = self._merged_rg_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -935,29 +964,32 @@ class LargeDecodeRunner:
             id2=merged_id2,
             contact_areas=merged_areas,
         )
-        return {"merged_rg_path": str(path), "num_edges": len(merged_affs)}
+        return {
+            "merged_rg_path": str(path),
+            "num_edges": int(len(merged_affs)),
+            "num_total_edges_considered": n_total_edges,
+        }
 
     def handle_agglomerate(self, record: TaskRecord) -> Dict[str, Any]:
-        """Threshold merge on the global region graph plus overlap pairs."""
+        """Threshold merge on the global region graph plus overlap pairs.
+
+        handle_merge_rg now filters by threshold itself (per chunk, before
+        concatenating -- see its docstring), so merged_rg already contains
+        only qualifying edges. No re-filtering needed here.
+        """
         data = np.load(self._merged_rg_path())
-        rg_affs = data["rg_affs"]
         id1 = data["id1"]
         id2 = data["id2"]
 
         offsets = self._read_json(self._offsets_path())
         global_max_id = int(offsets["global_max_id"])
 
-        # Use the highest threshold
-        threshold = max(self.config.thresholds)
-
         merge_id1: list[np.ndarray] = []
         merge_id2: list[np.ndarray] = []
 
-        # Merge region-graph edges with affinity >= threshold.
-        qualify = rg_affs >= threshold
-        if qualify.any():
-            merge_id1.append(id1[qualify])
-            merge_id2.append(id2[qualify])
+        if len(id1) > 0:
+            merge_id1.append(id1)
+            merge_id2.append(id2)
 
         n_stitch_pairs = 0
         for border in self.borders:
@@ -996,7 +1028,7 @@ class LargeDecodeRunner:
             "relabel_path": str(relabel_path),
             "global_max_id": global_max_id,
             "final_max_id": int(mapping.max()) if mapping.size else 0,
-            "num_rg_edges": int(np.count_nonzero(qualify)),
+            "num_rg_edges": int(len(id1)),
             "num_stitch_pairs": n_stitch_pairs,
         }
 
