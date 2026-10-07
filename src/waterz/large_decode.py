@@ -630,7 +630,15 @@ class LargeDecodeRunner:
     def handle_apply_relabel(self, record: TaskRecord) -> Dict[str, Any]:
         chunk = self.chunk_map[record.spec.key]
         offsets = self._read_json(self._offsets_path())
-        relabel = np.load(self._relabel_path())
+        # mmap instead of a full load: this file is global_max_id+1 elements
+        # (~12.5GB at the scale this hit in practice) and every one of the
+        # (up to thousands of) apply tasks loads it. A plain np.load would
+        # give every worker process its own full copy; mmap_mode='r' lets
+        # the OS back all of them with the same page-cache pages instead
+        # (safe since this file is never written to again after agglomerate
+        # produces it), rather than needing N times the memory for N
+        # concurrent workers.
+        relabel = np.load(self._relabel_path(), mmap_mode="r")
         seg = self._read_chunk_seg(self._raw_chunk_path(chunk.key))
         offset = int(offsets["chunk_offsets"][chunk.key])
         if offset:
