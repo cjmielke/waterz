@@ -13,3 +13,5 @@ src/waterz/**/*.pyc
 src/waterz/**/*.c
 src/waterz/**/*.so
 src/waterz/evaluate.cpp
+src/waterz/merge.cpp
+src/waterz/region_graph.cpp
